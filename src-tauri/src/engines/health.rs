@@ -236,11 +236,17 @@ fn runtime_contains_cuda(directory: &Path) -> bool {
     })
 }
 
-pub async fn require_cpu_colmap(paths: &EnginePaths) -> Result<()> {
+/// Returns `true` when the bundled COLMAP has CUDA support available,
+/// `false` when it should run in CPU-only mode.
+/// Errors only if COLMAP is missing or cannot start at all.
+pub async fn detect_colmap_gpu(paths: &EnginePaths) -> Result<bool> {
     let status = check_colmap(&paths.colmap).await;
-    if status.cpu_only == Some(true) && status.can_start {
-        Ok(())
-    } else {
-        Err(crate::error::SplatError::UnsupportedEngine(status.detail))
+    if !status.can_start {
+        return Err(crate::error::SplatError::UnsupportedEngine(status.detail));
     }
+    // cpu_only == Some(false) means CUDA runtime was found in the bundle.
+    // cpu_only == Some(true)  means the help output explicitly said no CUDA.
+    // cpu_only == None        means we are unsure; default to CPU to be safe.
+    let use_gpu = status.cpu_only == Some(false);
+    Ok(use_gpu)
 }

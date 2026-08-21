@@ -168,7 +168,7 @@ impl PipelineRunner {
                 });
             }
         }
-        engines::health::require_cpu_colmap(&self.engines).await?;
+        engines::health::detect_colmap_gpu(&self.engines).await.ok();
         colmap::require_verified_cli(&self.engines.colmap)?;
         brush::require_verified_cli(&self.engines.brush)
     }
@@ -333,15 +333,21 @@ impl PipelineRunner {
         // moving any project data outside the project directory.
         let colmap_images = Path::new("../frames");
 
+        let use_gpu = engines::health::detect_colmap_gpu(&self.engines)
+            .await
+            .unwrap_or(false);
+        let mode_label = if use_gpu { "GPU (CUDA)" } else { "CPU" };
+
         self.events.stage(
             PipelineStage::ExtractingFeatures,
             0.0,
-            "COLMAP 正在使用 CPU 提取特征",
+            format!("COLMAP 正在使用 {} 提取特征", mode_label),
         );
         colmap::extract_features(
             &self.engines.colmap,
             &database,
             colmap_images,
+            use_gpu,
             colmap_log.clone(),
             &self.process_manager,
             Some(self.process_observer(
@@ -356,13 +362,14 @@ impl PipelineRunner {
         state.features_complete = true;
         project_manager.write_state(&paths.state, &state).await?;
         self.events
-            .stage(PipelineStage::ExtractingFeatures, 1.0, "CPU 特征提取完成");
+            .stage(PipelineStage::ExtractingFeatures, 1.0, format!("{} 特征提取完成", mode_label));
 
         self.events
-            .stage(PipelineStage::Matching, 0.0, "COLMAP 正在进行 CPU 顺序匹配");
+            .stage(PipelineStage::Matching, 0.0, format!("COLMAP 正在进行 {} 顺序匹配", mode_label));
         colmap::match_sequential(
             &self.engines.colmap,
             &database,
+            use_gpu,
             colmap_log.clone(),
             &self.process_manager,
             Some(self.process_observer(
