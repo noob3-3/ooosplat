@@ -184,7 +184,7 @@ async fn check_colmap(path: &Path) -> EngineStatus {
     }
 
     let lower = help.to_ascii_lowercase();
-    let explicit_cpu = [
+    let explicit_no_cuda = [
         "cuda: no",
         "cuda support: no",
         "without cuda",
@@ -192,10 +192,19 @@ async fn check_colmap(path: &Path) -> EngineStatus {
     ]
     .iter()
     .any(|marker| lower.contains(marker));
+    let explicit_cuda = [
+        "cuda: yes",
+        "cuda support: yes",
+        "with cuda",
+        "cuda enabled",
+        "use_gpu",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
     let bundled_cuda = path.parent().is_some_and(runtime_contains_cuda);
-    let cpu_only = if bundled_cuda {
+    let cpu_only = if bundled_cuda || explicit_cuda {
         Some(false)
-    } else if explicit_cpu {
+    } else if explicit_no_cuda {
         Some(true)
     } else {
         None
@@ -206,8 +215,8 @@ async fn check_colmap(path: &Path) -> EngineStatus {
         .map(|line| line.trim().to_owned());
     let detail = match cpu_only {
         Some(true) => "三个必需命令可启动，帮助输出明确报告无 CUDA".into(),
-        Some(false) => "运行目录中发现 CUDA 运行时，拒绝将其标记为 CPU 版本".into(),
-        None => "命令可启动，但帮助输出未明确证明这是 CPU/no-CUDA 构建".into(),
+        Some(false) => "检测到 CUDA 支持（帮助输出或运行目录中发现 CUDA 运行时）".into(),
+        None => "命令可启动，但帮助输出未明确证明是否支持 CUDA，将由系统 CUDA 检测决定".into(),
     };
     EngineStatus {
         kind: EngineKind::Colmap,
@@ -236,11 +245,95 @@ fn runtime_contains_cuda(directory: &Path) -> bool {
     })
 }
 
-pub async fn require_cpu_colmap(paths: &EnginePaths) -> Result<()> {
+/// Returns `true` when the bundled COLMAP has CUDA support available,
+/// `false` when it should run in CPU-only mode.
+/// Errors only if COLMAP is missing or cannot start at all.
+///
+/// Detection strategy (in order):
+/// 1. COLMAP help output contains positive CUDA markers (e.g. "cuda: yes")
+///    or CUDA DLLs are found next to the executable → GPU.
+/// 2. COLMAP help output contains negative CUDA markers (e.g. "cuda: no") → CPU.
+/// 3. Neither: fall back to probing the system for a CUDA runtime via
+///    `nvidia-smi` (Windows/Linux) or `nvcc`. If found → GPU, else → CPU.
+pub async fn detect_colmap_gpu(paths: &EnginePaths) -> Result<bool> {
     let status = check_colmap(&paths.colmap).await;
-    if status.cpu_only == Some(true) && status.can_start {
-        Ok(())
-    } else {
-        Err(crate::error::SplatError::UnsupportedEngine(status.detail))
+    if !status.can_start {
+        return Err(crate::error::SplatError::UnsupportedEngine(status.detail));
     }
+    match status.cpu_only {
+        Some(false) => Ok(true),
+        Some(true) => Ok(false),
+        // Ambiguous: COLMAP help gave no clear answer. Ask the OS.
+        None => Ok(system_has_cuda().await),
+    }
+}
+
+/// Returns `true` when a CUDA-capable GPU driver is detected on the system.
+/// Tries `nvidia-smi` first (fastest, works on both Windows and Linux),
+/// then falls back to `nvcc --version` for CUDA toolkit installs.
+async fn system_has_cuda() -> bool {
+    let manager = ProcessManager::new();
+
+    // Try nvidia-smi – present whenever the NVIDIA driver is installed.
+    #[cfg(target_os = "windows")]
+    let nvidia_smi = "nvidia-smi.exe";
+    #[cfg(not(target_os = "windows"))]
+    let nvidia_smi = "nvidia-smi";
+
+    // Resolve through PATH
+    if let Some(nvidia_smi_path) = which_in_path(nvidia_smi) {
+        if let Ok(out) = manager
+            .run(ProcessSpec {
+                executable: nvidia_smi_path,
+                args: vec![],
+                working_directory: None,
+                log_path: None,
+                observer: None,
+            })
+            .await
+        {
+            if out.success {
+                return true;
+            }
+        }
+    }
+
+    // Fall back to nvcc
+    #[cfg(target_os = "windows")]
+    let nvcc = "nvcc.exe";
+    #[cfg(not(target_os = "windows"))]
+    let nvcc = "nvcc";
+
+    if let Some(nvcc_path) = which_in_path(nvcc) {
+        if let Ok(out) = manager
+            .run(ProcessSpec {
+                executable: nvcc_path,
+                args: vec!["--version".into()],
+                working_directory: None,
+                log_path: None,
+                observer: None,
+            })
+            .await
+        {
+            if out.success {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Look up `name` in the system `PATH`, returning the full path if found.
+fn which_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path_var| {
+        std::env::split_paths(&path_var).find_map(|dir| {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+    })
 }
